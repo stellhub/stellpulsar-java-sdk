@@ -1,20 +1,19 @@
 # StellPulsar Java SDK
 
-`stellpulsar-java-sdk` is the Java client SDK for [`stellhub/stellpulsar-service`](https://github.com/stellhub/stellpulsar-service), the weakly consistent distributed rate limiting server for traffic governance, quota checks, and low-latency token bucket decisions.
+`stellpulsar-java-sdk` is the Java client SDK for [`stellhub/stellpulsar-service`](https://github.com/stellhub/stellpulsar-service).
+
+The SDK is a Spring-free distributed quota client. It reads distributed rate limit rules through `stellorbit-java-sdk`, routes quota requests to the correct StellPulsar owner over gRPC, and exposes a framework-neutral `tryAcquire` API for integrations such as `stellflux`.
 
 ## Positioning
 
-This repository provides the Java client implementation for applications, gateways, platform services, and middleware components that need to consume StellPulsar rate limiting capabilities.
+This repository does not implement a local rate limiter or a Spring interceptor. Its responsibilities are:
 
-It does not implement distributed quota coordination locally. The SDK delegates limit decisions to `stellpulsar-service` and keeps Java applications aligned with the central StellPulsar rate limiting control surface.
+- Filter distributed rate limit rules from StellOrbit rule providers.
+- Discover StellPulsar topology and calculate shard owners with `rendezvous_hash_v1`.
+- Call `AcquireQuota` over gRPC and map service decisions into Java result models.
+- Expose `RateLimitResult` so framework adapters can decide whether to return HTTP 429, throw an exception, or apply fallback logic.
 
-## Capabilities
-
-- Rate limit check requests.
-- Per-key limit, window, and cost parameters.
-- API key based authentication header support.
-- Standard Java `HttpClient` transport without third-party runtime dependencies.
-- Timeout configuration for connection and request execution.
+Resilience4j is intentionally not a core dependency. If needed, it should be integrated in `stellflux` or a separate optional adapter module.
 
 ## Current Status
 
@@ -22,14 +21,12 @@ It does not implement distributed quota coordination locally. The SDK delegates 
 | --- | --- |
 | Stability | Early development |
 | Language | Java |
-| Minimum Java version | 17 |
-| Transport | `java.net.http.HttpClient` |
+| Minimum Java version | 25 |
+| Transport | gRPC |
+| Rule source | `stellorbit-java-sdk` |
 | Target service | `stellpulsar-service` |
-| Maintainer | StellHub |
 
 ## Installation
-
-The artifact coordinates are reserved for future publishing:
 
 ```xml
 <dependency>
@@ -44,41 +41,79 @@ The artifact coordinates are reserved for future publishing:
 ```java
 package example;
 
+import io.github.stellhub.stellpulsar.client.DefaultStellpulsarClient;
 import io.github.stellhub.stellpulsar.client.StellpulsarClient;
 import io.github.stellhub.stellpulsar.client.StellpulsarClientOptions;
-import io.github.stellhub.stellpulsar.client.StellpulsarHttpClient;
-import io.github.stellhub.stellpulsar.client.model.ApiResponse;
-import io.github.stellhub.stellpulsar.client.model.LimitCheckRequest;
-import java.net.URI;
+import io.github.stellhub.stellpulsar.client.model.RateLimitRequest;
+import io.github.stellhub.stellpulsar.client.model.RateLimitResult;
+import io.github.stellhub.stellpulsar.client.orbit.StellorbitDistributedRateLimitRuleProvider;
+import io.github.stellhub.stellpulsar.client.topology.DefaultTopologyManager;
+import io.github.stellhub.stellpulsar.client.topology.RendezvousHashOwnerSelector;
+import io.github.stellhub.stellpulsar.client.topology.TopologyDiscoveryRequest;
+import io.github.stellhub.stellpulsar.client.transport.grpc.GrpcStellpulsarTransport;
+import io.github.stellorbit.client.StellorbitClient;
 
 public class StellpulsarExample {
 
     public static void main(String[] args) {
-        StellpulsarClientOptions options = StellpulsarClientOptions.builder()
-                .endpoint(URI.create("http://localhost:8080"))
-                .apiKey("local-dev-api-key")
+        StellorbitClient orbitClient = createOrbitClient();
+        orbitClient.start();
+
+        GrpcStellpulsarTransport transport = GrpcStellpulsarTransport.builder()
+                .discoveryAddress("127.0.0.1", 9090)
+                .plaintext(true)
                 .build();
 
-        try (StellpulsarClient client = new StellpulsarHttpClient(options)) {
-            LimitCheckRequest request = new LimitCheckRequest(
-                    "tenant-a:/api/orders",
-                    100,
-                    60,
-                    1
-            );
+        StellpulsarClient client = new DefaultStellpulsarClient(StellpulsarClientOptions.builder()
+                .applicationCode("order-service")
+                .clientId("order-service-jvm-1")
+                .ruleProvider(new StellorbitDistributedRateLimitRuleProvider(orbitClient.rateLimits()))
+                .topologyManager(new DefaultTopologyManager(
+                        transport,
+                        new TopologyDiscoveryRequest(
+                                "default",
+                                "order-service",
+                                "order-service-jvm-1",
+                                java.util.List.of("stellpulsar.v1"),
+                                java.util.Map.of()),
+                        new RendezvousHashOwnerSelector()))
+                .quotaGateway(transport)
+                .build());
 
-            ApiResponse response = client.check(request);
-            System.out.println(response.body());
+        client.start();
+
+        RateLimitResult result = client.tryAcquire(RateLimitRequest.builder()
+                .applicationCode("order-service")
+                .targetService("order-service")
+                .resource("/api/orders")
+                .method("POST")
+                .tenantId("tenant-a")
+                .quotaKey("tenant-a:/api/orders")
+                .build());
+
+        if (result.limited()) {
+            System.out.println("rate limited, retryAfterMs=" + result.retryAfterMs());
+            return;
         }
+
+        System.out.println("request permitted, remaining=" + result.remaining());
+    }
+
+    private static StellorbitClient createOrbitClient() {
+        throw new UnsupportedOperationException("Create StellorbitClient with your StellOrbit/StellNula options.");
     }
 }
 ```
 
 ## API Surface
 
-| Method | Responsibility |
+| Type | Responsibility |
 | --- | --- |
-| `check(LimitCheckRequest request)` | Request a rate limit decision from StellPulsar |
+| `StellpulsarClient.tryAcquire(RateLimitRequest)` | Attempts to acquire remote distributed quota. |
+| `RateLimitResult` | Framework-neutral decision model with `permitted`, `limited`, `fallback`, `retryAfterMs`, and diagnostic fields. |
+| `DistributedRateLimitRuleProvider` | Internal SDK rule SPI. |
+| `StellorbitDistributedRateLimitRuleProvider` | Adapter from `stellorbit-java-sdk` rate limit rules to distributed quota rules. |
+| `GrpcStellpulsarTransport` | gRPC implementation of topology discovery and quota acquisition ports. |
 
 ## Development
 
@@ -88,16 +123,8 @@ Run verification:
 mvn test
 ```
 
-## Repository Scope
+## Documentation
 
-This SDK intentionally keeps the first version small. Future releases can add:
-
-- Strongly typed limit decision models.
-- OpenAPI generated DTOs when the service contract is stable.
-- Integration tests against local `stellpulsar-service`.
-- Retry and fail-open/fail-closed helpers.
-- Observability hooks for client-side metrics and tracing.
-
-## License
-
-The license will be defined before the first stable release.
+- [ADR](docs/ADR.md)
+- [stellpulsar-service ADR](https://github.com/stellhub/stellpulsar-service/blob/main/docs/ADR.md)
+- [Distributed Quota Consistency Design](https://github.com/stellhub/stellpulsar-service/blob/main/docs/distributed-quota-consistency.md)
