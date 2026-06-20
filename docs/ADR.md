@@ -102,9 +102,10 @@ List<GovernanceRule> rules = orbitClient.rateLimits().find(query);
 
 1. `ruleType` 必须是 `RATE_LIMIT`。
 2. `status` 必须是 `ACTIVE`。
-3. 规则内容必须声明由 StellPulsar 执行分布式配额，推荐规范字段为 `content.limit.mode = "DISTRIBUTED"` 或 `content.limit.backend = "stellpulsar"`。
-4. 规则必须包含可传给服务端的 `rule_id`、`revision`、`checksum`、`schema_version`、`quota`、`window`、`dimensions` 和 `fail_policy`。
-5. 缺少 `revision/checksum` 的分布式规则不能参与远端扣减，SDK 应按 fail policy 返回降级结果，并记录告警。
+3. `coordinationMode` 必须是 `GLOBAL_SYNC` 或 `GLOBAL_QUOTA`。
+4. `enforcementMode` 是旧版兼容字段，不能作为当前 SDK 的分布式规则事实源。
+5. 规则必须包含可传给服务端的 `rule_id`、`revision`、`checksum`、`schema_version`、`limitMode`、`limitType`、`limitAlgorithm`、`trafficProtocol`、`quotaConfig`、`windowConfig`、`keyExtractor` 和 `fallbackPolicy`。
+6. 缺少 `revision/checksum` 的分布式规则不能参与远端扣减，SDK 应按 fail policy 返回降级结果，并记录告警。
 
 内部规则模型建议：
 
@@ -116,15 +117,34 @@ DistributedRateLimitRule
   revision
   checksum
   schema_version
-  algorithm
+  limit_mode
+  limit_type
+  limit_algorithm
+  traffic_protocol
+  execution_location
+  coordination_mode
   quota
   window_seconds
   burst
   dimensions
-  cost_expression
+  request_matcher
+  key_extractor
+  quota_config
+  window_config
+  concurrency_config
+  hotspot_config
+  custom_policy
+  model_limit_config
+  fallback_policy
+  response_policy
+  observability_config
+  shadow_config
+  cost
   fail_policy
   attributes
 ```
+
+SDK 第一阶段通过 `tryAcquire` 支持 QPS、QUOTA、HEADER、BANDWIDTH 和非并发类 MODEL 配额请求。CONCURRENCY、CONNECTION、HOT_KEY、CUSTOM、MODEL_CONCURRENCY 或未知 `limitMode` / `limitAlgorithm` / `requestMatcher` schema / `keyExtractor` schema / `keyExtractor.source` 必须返回明确 unsupported error code，并按规则级 `fallbackPolicy` 映射的 fail policy 降级，不能静默当作 QPS 执行，也不能因为无法解析规则而直接当作无匹配规则放行。
 
 如果同一个请求匹配多条分布式限流规则，默认执行全部规则，任意一条返回 `DENIED` 即认为请求被限流；全部返回 `ALLOWED` 才认为请求可放行。规则执行顺序沿用 `stellorbit-java-sdk` Provider 的排序结果，即优先级升序、revision 降序、rule id 升序。
 
@@ -148,7 +168,7 @@ public interface StellpulsarClient extends AutoCloseable {
 }
 ```
 
-`RateLimitRequest` 由上层传入应用、目标服务、资源、租户、用户、业务维度和 attribute：
+`RateLimitRequest` 由上层传入应用、目标服务、资源、租户、用户、调用方、协议上下文、业务维度和 attribute：
 
 ```text
 RateLimitRequest
@@ -156,10 +176,21 @@ RateLimitRequest
   application_code
   target_service
   resource
+  method
+  endpoint
   tenant_id
   user_id
+  caller
+  api_key
+  remote_ip
+  model_request
+  model_tokens
+  model_cost
   quota_key
   cost
+  unit
+  headers
+  grpc_metadata
   attributes
 ```
 

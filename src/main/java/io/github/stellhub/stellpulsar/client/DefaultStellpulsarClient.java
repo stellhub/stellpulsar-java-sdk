@@ -66,20 +66,38 @@ public final class DefaultStellpulsarClient implements StellpulsarClient {
             publish(request, "", result);
             return result;
         }
-        if (rules.isEmpty()) {
-            RateLimitResult result = RateLimitResult.noMatchingRule(request.requestId());
-            publish(request, "", result);
-            return result;
-        }
-
         RateLimitResult lastAllowed = null;
+        boolean matched = false;
         for (DistributedRateLimitRule rule : rules) {
+            DistributedRateLimitRule.RequestMatchStatus matchStatus = rule.requestMatchStatus(request);
+            if (matchStatus == DistributedRateLimitRule.RequestMatchStatus.NOT_MATCHED) {
+                continue;
+            }
+            matched = true;
+            if (matchStatus == DistributedRateLimitRule.RequestMatchStatus.UNSUPPORTED) {
+                RateLimitResult result = fallback(
+                        rule,
+                        RateLimitDecision.INVALID_REQUEST,
+                        "unsupported_request_matcher",
+                        "UNSUPPORTED_REQUEST_MATCHER");
+                publish(request, rule.ruleId(), result);
+                if (!result.permitted()) {
+                    return result;
+                }
+                lastAllowed = result;
+                continue;
+            }
             RateLimitResult result = tryAcquireRule(request, rule);
             publish(request, rule.ruleId(), result);
             if (!result.permitted()) {
                 return result;
             }
             lastAllowed = result;
+        }
+        if (!matched) {
+            RateLimitResult result = RateLimitResult.noMatchingRule(request.requestId());
+            publish(request, "", result);
+            return result;
         }
         return lastAllowed == null ? RateLimitResult.noMatchingRule(request.requestId()) : lastAllowed;
     }
@@ -96,6 +114,14 @@ public final class DefaultStellpulsarClient implements StellpulsarClient {
     }
 
     private RateLimitResult tryAcquireRule(RateLimitRequest request, DistributedRateLimitRule rule) {
+        String unsupportedReason = rule.unsupportedReason(request);
+        if (!unsupportedReason.isBlank()) {
+            return fallback(
+                    rule,
+                    RateLimitDecision.INVALID_REQUEST,
+                    unsupportedReason.toLowerCase(java.util.Locale.ROOT),
+                    unsupportedReason);
+        }
         if (!rule.hasDigest()) {
             return fallback(rule, RateLimitDecision.INVALID_REQUEST, "distributed_rule_digest_missing", "RULE_DIGEST_MISSING");
         }

@@ -321,6 +321,187 @@ class DefaultStellpulsarClientTest {
         assertTrue(result.permitted());
     }
 
+    @Test
+    void tryAcquireFallsBackWhenLimitModeRequiresLifecycleApi() {
+        DistributedRateLimitRule rule = DistributedRateLimitRule.builder()
+                .applicationCode("order-service")
+                .ruleId("rule-concurrency")
+                .ruleName("concurrency")
+                .revision("100")
+                .checksum("abc")
+                .schemaVersion("v1")
+                .limitMode("CONCURRENCY")
+                .limitAlgorithm("CONCURRENCY_LIMIT")
+                .quota(10)
+                .windowSeconds(60)
+                .failPolicy(FailPolicy.FAIL_CLOSED)
+                .build();
+        StellpulsarClient client = client(List.of(rule), command -> {
+            throw new AssertionError("unsupported limit mode must not call remote quota gateway");
+        });
+
+        RateLimitResult result = client.tryAcquire(request());
+
+        assertFalse(result.permitted());
+        assertTrue(result.fallback());
+        assertEquals("UNSUPPORTED_LIMIT_MODE", result.errorCode());
+    }
+
+    @Test
+    void tryAcquireFallsBackWhenRequestMatcherSchemaIsUnsupported() {
+        DistributedRateLimitRule rule = DistributedRateLimitRule.builder()
+                .applicationCode("order-service")
+                .ruleId("rule-matcher")
+                .ruleName("unsupported matcher")
+                .revision("100")
+                .checksum("abc")
+                .schemaVersion("v1")
+                .limitMode("QPS")
+                .limitType("REQUEST")
+                .trafficProtocol("HTTP")
+                .coordinationMode("GLOBAL_QUOTA")
+                .algorithm("fixed_window")
+                .requestMatcher(Map.of("headers", Map.of("x-plan", Map.of("between", List.of("silver", "gold")))))
+                .quota(100)
+                .windowSeconds(60)
+                .failPolicy(FailPolicy.FAIL_CLOSED)
+                .build();
+        StellpulsarClient client = client(List.of(rule), command -> {
+            throw new AssertionError("unsupported request matcher must not call remote quota gateway");
+        });
+
+        RateLimitResult result = client.tryAcquire(request());
+
+        assertFalse(result.permitted());
+        assertTrue(result.fallback());
+        assertEquals("UNSUPPORTED_REQUEST_MATCHER", result.errorCode());
+    }
+
+    @Test
+    void tryAcquireMatchesSupportedRequestMatcherOperators() {
+        DistributedRateLimitRule rule = DistributedRateLimitRule.builder()
+                .applicationCode("order-service")
+                .ruleId("rule-matcher")
+                .ruleName("supported matcher")
+                .revision("100")
+                .checksum("abc")
+                .schemaVersion("v1")
+                .limitMode("QPS")
+                .limitType("REQUEST")
+                .trafficProtocol("HTTP")
+                .coordinationMode("GLOBAL_QUOTA")
+                .algorithm("fixed_window")
+                .requestMatcher(Map.of(
+                        "anyOf", List.of(
+                                Map.of("path", Map.of("prefix", "/internal")),
+                                Map.of("method", List.of("POST", "PUT"))),
+                        "headers", Map.of("x-tenant", Map.of("equals", "TENANT-A", "ignoreCase", true))))
+                .quota(100)
+                .windowSeconds(60)
+                .failPolicy(FailPolicy.FAIL_OPEN)
+                .build();
+        List<String> ruleIds = new ArrayList<>();
+        StellpulsarClient client = client(List.of(rule), command -> {
+            ruleIds.add(command.rule().ruleId());
+            return QuotaGatewayResponse.allowed(
+                    command.requestId(),
+                    command.rule().ruleId(),
+                    command.rule().revision(),
+                    command.rule().checksum());
+        });
+
+        RateLimitResult result = client.tryAcquire(RateLimitRequest.builder()
+                .requestId("req-1")
+                .applicationCode("order-service")
+                .targetService("order-service")
+                .resource("/orders")
+                .method("POST")
+                .tenantId("tenant-a")
+                .quotaKey("tenant-a:/orders")
+                .header("X-Tenant", "tenant-a")
+                .build());
+
+        assertTrue(result.permitted());
+        assertEquals(List.of("rule-matcher"), ruleIds);
+    }
+
+    @Test
+    void tryAcquireFallsBackWhenKeyExtractorSchemaIsUnsupported() {
+        DistributedRateLimitRule rule = DistributedRateLimitRule.builder()
+                .applicationCode("order-service")
+                .ruleId("rule-key-extractor")
+                .ruleName("unsupported extractor")
+                .revision("100")
+                .checksum("abc")
+                .schemaVersion("v1")
+                .limitMode("QPS")
+                .limitType("REQUEST")
+                .trafficProtocol("HTTP")
+                .coordinationMode("GLOBAL_QUOTA")
+                .algorithm("fixed_window")
+                .keyExtractor(Map.of("selector", List.of("tenantId")))
+                .quota(100)
+                .windowSeconds(60)
+                .failPolicy(FailPolicy.FAIL_CLOSED)
+                .build();
+        StellpulsarClient client = client(List.of(rule), command -> {
+            throw new AssertionError("unsupported key extractor must not call remote quota gateway");
+        });
+
+        RateLimitResult result = client.tryAcquire(request());
+
+        assertFalse(result.permitted());
+        assertTrue(result.fallback());
+        assertEquals("UNSUPPORTED_KEY_EXTRACTOR_SCHEMA", result.errorCode());
+    }
+
+    @Test
+    void tryAcquireUsesModelTokenKeyExtractorFromRequestContext() {
+        DistributedRateLimitRule rule = DistributedRateLimitRule.builder()
+                .applicationCode("order-service")
+                .ruleId("rule-model")
+                .ruleName("model tokens")
+                .revision("100")
+                .checksum("abc")
+                .schemaVersion("v1")
+                .limitMode("MODEL")
+                .limitType("TOKEN")
+                .trafficProtocol("HTTP")
+                .coordinationMode("GLOBAL_QUOTA")
+                .algorithm("token_bucket")
+                .keyExtractor(Map.of("fields", List.of(Map.of(
+                        "name", "tokens",
+                        "source", "MODEL_TOKEN",
+                        "required", true))))
+                .quota(100)
+                .windowSeconds(60)
+                .failPolicy(FailPolicy.FAIL_OPEN)
+                .build();
+        List<String> quotaKeys = new ArrayList<>();
+        StellpulsarClient client = client(List.of(rule), command -> {
+            quotaKeys.add(command.quotaKey());
+            return QuotaGatewayResponse.allowed(
+                    command.requestId(),
+                    command.rule().ruleId(),
+                    command.rule().revision(),
+                    command.rule().checksum());
+        });
+
+        RateLimitResult result = client.tryAcquire(RateLimitRequest.builder()
+                .requestId("req-1")
+                .applicationCode("order-service")
+                .targetService("order-service")
+                .resource("/v1/chat/completions")
+                .method("POST")
+                .tenantId("tenant-a")
+                .modelRequest("chat")
+                .modelTokens(42)
+                .build());
+
+        assertTrue(result.permitted());
+        assertEquals(List.of("tokens=42"), quotaKeys);
+    }
+
     private static StellpulsarClient client(List<DistributedRateLimitRule> rules, QuotaGateway quotaGateway) {
         return client(new StaticDistributedRateLimitRuleProvider(rules), topologyManager(), quotaGateway);
     }
@@ -391,6 +572,10 @@ class DefaultStellpulsarClientTest {
                 .revision(revision)
                 .checksum(checksum)
                 .schemaVersion("v1")
+                .limitMode("QPS")
+                .limitType("REQUEST")
+                .trafficProtocol("HTTP")
+                .coordinationMode("GLOBAL_QUOTA")
                 .algorithm("fixed_window")
                 .quota(100)
                 .windowSeconds(60)
